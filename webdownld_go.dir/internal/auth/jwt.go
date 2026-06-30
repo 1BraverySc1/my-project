@@ -15,6 +15,7 @@ import (
 type JWTClaims struct {
 	UserID   int64  `json:"user_id"`   // UserID 登录用户的唯一标识。
 	Username string `json:"username"`  // Username 登录账号名。
+	IsAdmin  bool   `json:"is_admin"`  // IsAdmin 是否为系统管理员。
 	IsMember bool   `json:"is_member"` // IsMember 当前是否为有效会员。
 }
 
@@ -36,23 +37,24 @@ func NewJWTService(secret string, accessTTL, refreshTTL time.Duration) *JWTServi
 }
 
 // GenerateAccessToken 为用户生成短期访问令牌。
-func (s *JWTService) GenerateAccessToken(userID int64, username string, isMember bool) (string, error) {
-	return s.signToken(userID, username, isMember, s.accessTTL)
+func (s *JWTService) GenerateAccessToken(userID int64, username string, isAdmin, isMember bool) (string, error) {
+	return s.signToken(userID, username, isAdmin, isMember, s.accessTTL)
 }
 
 // GenerateRefreshToken 为用户生成长期刷新令牌，用于续期访问令牌。
 func (s *JWTService) GenerateRefreshToken(userID int64, username string) (string, error) {
-	return s.signToken(userID, username, false, s.refreshTTL)
+	return s.signToken(userID, username, false, false, s.refreshTTL)
 }
 
 // signToken 构造 JWT 三段式令牌并返回。
-func (s *JWTService) signToken(userID int64, username string, isMember bool, ttl time.Duration) (string, error) {
+func (s *JWTService) signToken(userID int64, username string, isAdmin, isMember bool, ttl time.Duration) (string, error) {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 
 	now := time.Now()
 	claims := map[string]any{
 		"user_id":   userID,
 		"username":  username,
+		"is_admin":  isAdmin,
 		"is_member": isMember,
 		"iat":       now.Unix(),
 		"exp":       now.Add(ttl).Unix(),
@@ -111,6 +113,9 @@ func (s *JWTService) ValidateToken(tokenString string) (*JWTClaims, error) {
 	}
 	if v, ok := raw["username"].(string); ok {
 		claims.Username = v
+	}
+	if v, ok := raw["is_admin"].(bool); ok {
+		claims.IsAdmin = v
 	}
 	if v, ok := raw["is_member"].(bool); ok {
 		claims.IsMember = v

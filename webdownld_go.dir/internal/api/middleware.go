@@ -126,7 +126,8 @@ func JWTAuthMiddleware(jwtService *auth.JWTService) gin.HandlerFunc {
 
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
-		c.Set("is_member", claims.IsMember)
+		c.Set("is_admin", claims.IsAdmin)
+			c.Set("is_member", claims.IsMember)
 		c.Next()
 	}
 }
@@ -159,4 +160,12 @@ func (h *Handler) Shutdown() {
 	INFO("shutting down chunk worker pool...")
 	h.chunkPool.Shutdown()
 	INFO("chunk worker pool stopped")
+
+	if h.lockFactory != nil {
+		INFO("closing Redis lock factory...")
+		if err := h.lockFactory.Close(); err != nil {
+			INFO("Redis lock factory close error", "error", err)
+		}
+		INFO("Redis lock factory closed")
+	}
 }

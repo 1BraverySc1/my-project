@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"webdownld_go/internal/config"
+	"webdownld_go/internal/lock"
 	"webdownld_go/internal/meta"
 	"webdownld_go/internal/model"
 	"webdownld_go/internal/storage"
@@ -17,44 +17,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// uploadLockVal 包装 sync.Mutex 并记录最后一次使用时间，用于定期清理。
-type uploadLockVal struct {
-	mu     sync.Mutex
-	lastAt time.Time
-}
-
 type Handler struct {
-	meta        *meta.Service    // meta 元数据服务，负责 Raft 一致性读写。
-	storage     *storage.Service // storage 分片存储服务。
-	chunkSize   int64            // chunkSize 当前服务使用的分片大小（字节）。
-	chunkPool   *ChunkWorkerPool // chunkPool 固定 worker 分片写入池。
-	uploadLocks sync.Map         // uploadLocks 按 uploadID 管理会话级互斥锁（含惰性清理）。
-}
-
-// cleanUploadLocks 启动后台协程，每 5 分钟清理超过 10 分钟未使用的上传锁，防止内存泄漏。
-func (h *Handler) cleanUploadLocks() {
-	go func() {
-		for {
-			time.Sleep(5 * time.Minute)
-			now := time.Now()
-			h.uploadLocks.Range(func(key, value any) bool {
-				v := value.(*uploadLockVal)
-				v.mu.Lock()
-				if now.Sub(v.lastAt) > 10*time.Minute {
-					v.mu.Unlock()
-					h.uploadLocks.Delete(key)
-					return true
-				}
-				v.mu.Unlock()
-				return true
-			})
-		}
-	}()
+	meta        *meta.Service       // meta 元数据服务，负责 Raft 一致性读写。
+	storage     *storage.Service    // storage 分片存储服务。
+	chunkSize   int64               // chunkSize 当前服务使用的分片大小（字节）。
+	chunkPool   *ChunkWorkerPool    // chunkPool 固定 worker 分片写入池。
+	lockFactory *lock.LockFactory   // lockFactory 分布式锁工厂，按 uploadID 创建跨实例互斥锁。
 }
 
 // New 创建 API 处理器实例。
-// metaSvc 为元数据服务，storageSvc 为存储服务，maxConcurrentChunkWrites 为并发写入上限。
-func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkWrites int) *Handler {
+// metaSvc 为元数据服务，storageSvc 为存储服务，maxConcurrentChunkWrites 为并发写入上限，lf 为分布式锁工厂。
+func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkWrites int, lf *lock.LockFactory) *Handler {
 	if maxConcurrentChunkWrites <= 0 {
 		maxConcurrentChunkWrites = 64
 	}
@@ -64,7 +37,7 @@ func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkW
 	h.storage = storageSvc
 	h.chunkSize = config.ChunkSize()
 	h.chunkPool = NewChunkWorkerPool(storageSvc, maxConcurrentChunkWrites, queueSize)
-	h.cleanUploadLocks()
+	h.lockFactory = lf
 	return h
 }
 
@@ -157,9 +130,14 @@ func (h *Handler) uploadStatus(c *gin.Context) {
 // uploadChunk 接收并保存单个分片，同时更新上传会话状态。
 func (h *Handler) uploadChunk(c *gin.Context) {
 	uploadID := c.Param("uploadID")
-	lock := h.getUploadLock(uploadID)
-	lock.Lock()
-	defer lock.Unlock()
+
+	// 使用 Redis 分布式锁保护临界区，保证多实例部署时同一上传会话的 chunk 串行处理。
+	dl := h.lockFactory.NewLock("upload:lock:" + uploadID)
+	if err := dl.Lock(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "服务器繁忙，请重试"})
+		return
+	}
+	defer dl.Unlock(c.Request.Context())
 
 	ss, err := h.meta.GetUploadSession(c.Request.Context(), uploadID)
 	if err != nil {
@@ -235,9 +213,14 @@ func (h *Handler) uploadChunk(c *gin.Context) {
 // completeUpload 在所有分片上传完成后组装并固化文件元数据。
 func (h *Handler) completeUpload(c *gin.Context) {
 	uploadID := c.Param("uploadID")
-	lock := h.getUploadLock(uploadID)
-	lock.Lock()
-	defer lock.Unlock()
+
+	// 使用 Redis 分布式锁保护临界区，保证多实例部署时上传会话完整性。
+	dl := h.lockFactory.NewLock("upload:lock:" + uploadID)
+	if err := dl.Lock(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "服务器繁忙，请重试"})
+		return
+	}
+	defer dl.Unlock(c.Request.Context())
 
 	ss, err := h.meta.GetUploadSession(c.Request.Context(), uploadID)
 	if err != nil {
@@ -294,16 +277,6 @@ func (h *Handler) completeUpload(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "file": metaFile})
-}
-
-// getUploadLock 获取指定上传会话的互斥锁（惰性创建，后台协程定期清理过期锁）。
-func (h *Handler) getUploadLock(uploadID string) *sync.Mutex {
-	v, _ := h.uploadLocks.LoadOrStore(uploadID, &uploadLockVal{})
-	lv := v.(*uploadLockVal)
-	lv.mu.Lock()
-	lv.lastAt = time.Now()
-	lv.mu.Unlock()
-	return &lv.mu
 }
 
 // expectedChunkSize 计算指定分片索引的期望大小（尾部分片可能不足 chunkSize）。

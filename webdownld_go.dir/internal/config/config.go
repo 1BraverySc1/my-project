@@ -18,9 +18,17 @@ type Config struct {
 
 	// 用户系统与安全配置。
 	MySQLDSN            string        // MySQLDSN MySQL 数据库连接字符串。
+	AdminUsername       string        // AdminUsername 系统管理员登录用户名。
+	AdminPassword       string        // AdminPassword 系统管理员登录密码。
 	JWTSecret            string        // JWTSecret JWT 签名密钥。
 	JWTAccessTokenTTL    time.Duration // JWTAccessTokenTTL 访问令牌有效期。
 	JWTRefreshTokenTTL   time.Duration // JWTRefreshTokenTTL 刷新令牌有效期。
+
+	// Redis 分布式锁配置。
+	RedisAddr      string // RedisAddr Redis 服务器地址（默认 "127.0.0.1:6379"）。
+	RedisPassword  string // RedisPassword Redis 认证密码（默认空）。
+	RedisDB        int    // RedisDB Redis 数据库编号（默认 0）。
+	LockTTLSeconds int    // LockTTLSeconds 分布式锁 TTL 秒数（默认 30）。
 
 	// 消息队列配置。
 	RabbitMQURL string // RabbitMQURL RabbitMQ 连接地址。
@@ -68,9 +76,17 @@ func Load() Config {
 
 	// 用户系统配置。
 	cfg.MySQLDSN = env("MYSQL_DSN", "root:root@tcp(127.0.0.1:3306)/cloudraft?parseTime=true&charset=utf8mb4")
+	cfg.AdminUsername = env("ADMIN_USERNAME", "admin")
+	cfg.AdminPassword = env("ADMIN_PASSWORD", "admin123")
 	cfg.JWTSecret = env("JWT_SECRET", "cloudraft-jwt-secret-change-me-in-production")
 	cfg.JWTAccessTokenTTL = time.Duration(envInt64("JWT_ACCESS_TTL_HOURS", 2)) * time.Hour
 	cfg.JWTRefreshTokenTTL = time.Duration(envInt64("JWT_REFRESH_TTL_DAYS", 7)) * 24 * time.Hour
+
+	// Redis 分布式锁配置。
+	cfg.RedisAddr = env("REDIS_ADDR", "127.0.0.1:6379")
+	cfg.RedisPassword = env("REDIS_PASSWORD", "")
+	cfg.RedisDB = int(envInt64("REDIS_DB", 0))
+	cfg.LockTTLSeconds = int(envInt64("LOCK_TTL_SECONDS", 30))
 
 	// 消息队列配置。
 	cfg.RabbitMQURL = env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")

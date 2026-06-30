@@ -7,6 +7,7 @@ type User struct {
 	ID           int64      `json:"id"`            // ID 用户唯一标识。
 	Username     string     `json:"username"`      // Username 登录账号名。
 	PasswordHash string     `json:"-"`             // PasswordHash bcrypt 加密后的密码，JSON 序列化时隐藏。
+	IsAdmin      bool       `json:"is_admin"`      // IsAdmin 是否为系统管理员。
 	IsMember     bool       `json:"is_member"`     // IsMember 当前是否为有效会员。
 	MemberExpire *time.Time `json:"member_expire"` // MemberExpire 会员有效期截止时间，nil 表示从未开通。
 	CreatedAt    time.Time  `json:"created_at"`    // CreatedAt 用户注册时间。

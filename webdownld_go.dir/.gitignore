@@ -1,0 +1,13 @@
+# 编译产物
+server
+storagenode
+raftImpl/bin/
+
+# 环境配置（含密钥，不提交）
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

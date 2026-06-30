@@ -13,6 +13,7 @@ import (
 	"webdownld_go/internal/api"
 	"webdownld_go/internal/auth"
 	"webdownld_go/internal/config"
+	"webdownld_go/internal/lock"
 	"webdownld_go/internal/meta"
 	"webdownld_go/internal/mq"
 	"webdownld_go/internal/payment"
@@ -41,7 +42,7 @@ func main() {
 	// 初始化 MySQL 数据库连接（可选，不可用时跳过用户/支付功能）。
 	var mysqlStore *store.MySQLStore
 	var err error
-	mysqlStore, err = store.NewMySQLStore(cfg.MySQLDSN)
+	mysqlStore, err = store.NewMySQLStore(cfg.MySQLDSN, cfg.AdminUsername, cfg.AdminPassword)
 	if err != nil {
 		api.INFO("MySQL 不可用，跳过用户认证与支付功能", "error", err)
 		mysqlStore = nil
@@ -49,11 +50,9 @@ func main() {
 		defer mysqlStore.Close()
 	}
 
-	// 初始化 JWT 服务（MySQL 不可用时跳过）。
+	// 初始化 JWT 服务（始终创建，管理员无 MySQL 时也可登录）。
 	var jwtService *auth.JWTService
-	if mysqlStore != nil {
-		jwtService = auth.NewJWTService(cfg.JWTSecret, cfg.JWTAccessTokenTTL, cfg.JWTRefreshTokenTTL)
-	}
+	jwtService = auth.NewJWTService(cfg.JWTSecret, cfg.JWTAccessTokenTTL, cfg.JWTRefreshTokenTTL)
 
 	// 初始化支付宝支付服务（若未配置则跳过）。
 	var alipaySvc *payment.AlipayService
@@ -83,12 +82,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	h := api.New(metaSvc, storageSvc, cfg.MaxConcurrentChunkWrites)
+	// 初始化 Redis 分布式锁工厂（多实例部署时保证上传会话互斥）。
+	lockTTL := time.Duration(cfg.LockTTLSeconds) * time.Second
+	lockFactory, err := lock.NewLockFactory(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, lockTTL)
+	if err != nil {
+		slog.Error("init lock factory failed", "error", err)
+		os.Exit(1)
+	}
+	defer lockFactory.Close()
 
-	// 初始化用户认证处理器（仅 MySQL 可用时）。
+	h := api.New(metaSvc, storageSvc, cfg.MaxConcurrentChunkWrites, lockFactory)
+
+	// 初始化用户认证处理器。
+	// MySQL 可用时：完整注册/登录/令牌刷新（数据库持久化）。
+	// MySQL 不可用时：仅管理员登录（凭据来自环境变量，JWT 签发）。
 	var authHandler *api.AuthHandler
-	if mysqlStore != nil && jwtService != nil {
-		authHandler = api.NewAuthHandler(mysqlStore.DB, jwtService)
+	if mysqlStore != nil {
+		authHandler = api.NewAuthHandler(mysqlStore.DB, jwtService, cfg.AdminUsername)
+	} else {
+		authHandler = api.NewAdminOnlyAuthHandler(jwtService, cfg.AdminUsername, cfg.AdminPassword)
 	}
 
 	// 初始化支付处理器（仅 MySQL 可用时）。
