@@ -106,7 +106,7 @@ func main() {
 	// 初始化支付处理器（仅 MySQL 可用时）。
 	var paymentHandler *api.PaymentHandler
 	if mysqlStore != nil && alipaySvc != nil {
-		paymentHandler = api.NewPaymentHandler(mysqlStore.DB, alipaySvc, eventBus)
+		paymentHandler = api.NewPaymentHandler(mysqlStore.DB, alipaySvc, eventBus, lockFactory)
 	}
 
 	r := gin.New()

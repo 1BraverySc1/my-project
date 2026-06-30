@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"webdownld_go/internal/lock"
 	"webdownld_go/internal/model"
 	"webdownld_go/internal/mq"
 	"webdownld_go/internal/payment"
@@ -15,17 +16,19 @@ import (
 
 // PaymentHandler 支付处理器，处理会员套餐查询、订单创建和支付宝回调。
 type PaymentHandler struct {
-	db       *sql.DB                // db MySQL 数据库连接。
-	alipay   *payment.AlipayService // alipay 支付宝支付服务。
-	eventBus *mq.TopicExchange      // eventBus 订单事件总线。
+	db          *sql.DB                // db MySQL 数据库连接。
+	alipay      *payment.AlipayService // alipay 支付宝支付服务。
+	eventBus    *mq.TopicExchange      // eventBus 订单事件总线。
+	lockFactory *lock.LockFactory      // lockFactory 分布式锁工厂，防止并发回调重复处理。
 }
 
 // NewPaymentHandler 创建支付处理器实例。
-func NewPaymentHandler(database *sql.DB, alipaySvc *payment.AlipayService, bus *mq.TopicExchange) *PaymentHandler {
+func NewPaymentHandler(database *sql.DB, alipaySvc *payment.AlipayService, bus *mq.TopicExchange, lf *lock.LockFactory) *PaymentHandler {
 	h := new(PaymentHandler)
 	h.db = database
 	h.alipay = alipaySvc
 	h.eventBus = bus
+	h.lockFactory = lf
 	return h
 }
 
@@ -114,6 +117,10 @@ func (h *PaymentHandler) createOrder(c *gin.Context) {
 }
 
 // paymentNotify 接收支付宝异步通知，验证签名后更新订单状态并开通会员。
+// 防重复支付三重保障：
+//  1. Redis 分布式锁（按 out_trade_no），跨实例串行化处理同一订单回调。
+//  2. 数据库事务 + SELECT ... FOR UPDATE 行锁，保证读-判-写原子性。
+//  3. alipay_trade_no 唯一约束，数据库层面硬防重复。
 func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 	params := make(map[string]string)
 	c.Request.ParseForm()
@@ -143,15 +150,34 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 		return
 	}
 
-	// 查询订单信息。
+	// 第一重防护：Redis 分布式锁，按 out_trade_no 串行化处理。
+	dl := h.lockFactory.NewLock("payment:notify:" + outTradeNo)
+	if err := dl.Lock(c.Request.Context()); err != nil {
+		INFO("获取支付回调锁失败，可能并发处理中", "out_trade_no", outTradeNo, "error", err)
+		c.String(http.StatusOK, "success") // 返回 success 让支付宝稍后重试
+		return
+	}
+	defer dl.Unlock(c.Request.Context())
+
+	// 第二重防护：数据库事务 + SELECT ... FOR UPDATE 行锁。
+	tx, err := h.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		INFO("开启支付事务失败", "error", err)
+		c.String(http.StatusInternalServerError, "fail")
+		return
+	}
+	defer tx.Rollback() // 事务异常时自动回滚，提交后 Rollback 无操作。
+
+	// SELECT ... FOR UPDATE 锁定订单行，防止并发读写。
 	var order model.Order
-	err = h.db.QueryRow(
-		"SELECT id, user_id, plan_id, amount_cent, status FROM orders WHERE id = ? AND status = ?",
+	err = tx.QueryRow(
+		"SELECT id, user_id, plan_id, amount_cent, status FROM orders WHERE id = ? AND status = ? FOR UPDATE",
 		orderID, model.StatusPending,
 	).Scan(&order.ID, &order.UserID, &order.PlanID, &order.AmountCent, &order.Status)
 
 	if err == sql.ErrNoRows {
-		// 订单已处理或不存在。
+		// 订单已处理或不存在，幂等返回 success。
+		tx.Rollback()
 		c.String(http.StatusOK, "success")
 		return
 	}
@@ -161,9 +187,9 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 		return
 	}
 
-	// 更新订单状态。
+	// 更新订单状态为已支付。
 	now := time.Now()
-	_, err = h.db.Exec(
+	_, err = tx.Exec(
 		"UPDATE orders SET status = ?, alipay_trade_no = ?, paid_at = ? WHERE id = ?",
 		model.StatusPaid, tradeNo, now, orderID,
 	)
@@ -183,21 +209,31 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 		}
 	}
 	if plan == nil {
+		tx.Rollback()
 		c.String(http.StatusOK, "success")
 		return
 	}
 
-	// 开通/续费会员。
-	memberExpire := now.Add(time.Duration(plan.DurationDays) * 24 * time.Hour)
-	_, err = h.db.Exec(
-		"UPDATE users SET is_member = 1, member_expire = ?, updated_at = ? WHERE id = ?",
-		memberExpire, now, order.UserID,
+	// 开通/续费会员：从当前到期时间累加，而非重置为 now + days。
+	// 使用 GREATEST 确保已有会员时叠加、无会员时从当前时间起算。
+	_, err = tx.Exec(
+		"UPDATE users SET is_member = 1, member_expire = GREATEST(IFNULL(member_expire, ?), ?) + INTERVAL ? DAY, updated_at = ? WHERE id = ?",
+		now, now, plan.DurationDays, now, order.UserID,
 	)
 	if err != nil {
 		INFO("开通会员失败", "error", err)
+		c.String(http.StatusInternalServerError, "fail")
+		return
 	}
 
-	// 发布支付成功和会员升级事件。
+	// 提交事务。
+	if err := tx.Commit(); err != nil {
+		INFO("提交支付事务失败", "error", err)
+		c.String(http.StatusInternalServerError, "fail")
+		return
+	}
+
+	// 发布支付成功和会员升级事件（事务提交后，避免未提交就读到）。
 	h.eventBus.Publish(mq.RoutingKeyOrderPaid, mq.OrderEvent{
 		OrderID:    orderID,
 		UserID:     order.UserID,

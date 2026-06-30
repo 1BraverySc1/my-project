@@ -77,7 +77,8 @@ func (s *MySQLStore) autoMigrate() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			paid_at DATETIME NULL,
 			INDEX idx_user_id (user_id),
-			INDEX idx_status (status)
+			INDEX idx_status (status),
+			UNIQUE INDEX idx_trade_no (alipay_trade_no)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 
