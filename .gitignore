@@ -1,2 +1,4 @@
 agent_go.dir/*.md
-agent_go.dir/*.md
+agent_go.dir/**/*.md
+webdownld_go.dir/*.md
+webdownld_go.dir/**/*.md
