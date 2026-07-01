@@ -15,10 +15,10 @@ import (
 
 // AuthHandler 用户认证处理器，处理注册、登录、令牌刷新和用户信息查询。
 type AuthHandler struct {
-	db             *sql.DB          // db MySQL 数据库连接（nil = 管理员独占模式）。
-	jwt            *auth.JWTService // jwt JWT 令牌服务。
-	adminUsername  string           // adminUsername 系统管理员用户名。
-	adminPassHash  string           // adminPassHash 管理员 bcrypt 密码哈希（MySQL 不可用时使用）。
+	db            *sql.DB          // db MySQL 数据库连接（nil = 管理员独占模式）。
+	jwt           *auth.JWTService // jwt JWT 令牌服务。
+	adminUsername string           // adminUsername 系统管理员用户名。
+	adminPassHash string           // adminPassHash 管理员 bcrypt 密码哈希（MySQL 不可用时使用）。
 }
 
 // NewAuthHandler 创建认证处理器实例（完整模式，需要 MySQL）。
@@ -142,7 +142,7 @@ func (h *AuthHandler) loginUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": "令牌生成失败"})
 			return
 		}
-		refreshToken, err := h.jwt.GenerateRefreshToken(1, h.adminUsername)
+		refreshToken, err := h.jwt.GenerateRefreshToken(1, h.adminUsername, true)
 		if err != nil {
 			INFO("生成刷新令牌失败", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": "令牌生成失败"})
@@ -196,7 +196,7 @@ func (h *AuthHandler) loginUser(c *gin.Context) {
 		return
 	}
 
-	refreshToken, err := h.jwt.GenerateRefreshToken(user.ID, user.Username)
+	refreshToken, err := h.jwt.GenerateRefreshToken(user.ID, user.Username, user.IsAdmin)
 	if err != nil {
 		INFO("生成刷新令牌失败", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": "令牌生成失败"})
@@ -270,7 +270,7 @@ func (h *AuthHandler) refreshToken(c *gin.Context) {
 		return
 	}
 
-	claims, err := h.jwt.ValidateToken(req.RefreshToken)
+	claims, err := h.jwt.ValidateRefreshToken(req.RefreshToken)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "刷新令牌无效或已过期"})
 		return

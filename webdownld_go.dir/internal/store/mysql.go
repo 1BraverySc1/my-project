@@ -73,13 +73,15 @@ func (s *MySQLStore) autoMigrate() error {
 			plan_id BIGINT NOT NULL,
 			amount_cent BIGINT NOT NULL,
 			status VARCHAR(16) DEFAULT 'pending',
-			alipay_trade_no VARCHAR(64) DEFAULT '',
+			alipay_trade_no VARCHAR(64) NULL DEFAULT NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			paid_at DATETIME NULL,
 			INDEX idx_user_id (user_id),
 			INDEX idx_status (status),
 			UNIQUE INDEX idx_trade_no (alipay_trade_no)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`UPDATE orders SET alipay_trade_no = NULL WHERE alipay_trade_no = ''`,
+		`ALTER TABLE orders MODIFY alipay_trade_no VARCHAR(64) NULL DEFAULT NULL`,
 	}
 
 	for _, q := range queries {

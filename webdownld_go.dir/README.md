@@ -18,13 +18,13 @@
 
 ### 分布式锁（新增）
 - Redis 分布式锁：基于 RESP2 协议自研极简 Redis 客户端，支持 SET NX PX 原子获取锁 + Lua 脚本安全释放。
-- 看门狗机制：锁持有期间自动续期（每 ttl/3 间隔 EXPIRE），防止长操作（大文件分片上传）锁过期被抢占。
+- 看门狗机制：每 ttl/3 通过 Lua 校验 token 后执行 PEXPIRE，防止旧持有者续期其他实例的新锁。
 - 多实例部署：替代进程内 sync.Map，保证跨实例上传会话互斥。
 
 ### 会员充值（新增）
 - 支付宝支付：对接支付宝电脑网站支付，支持沙箱/生产模式切换。
 - 订单系统：pending → paid → expired/refunded 完整订单生命周期。
-- Topic 事件总线：内存版 RabbitMQ Topic Exchange，支持 `order.#`、`member.#` 路由键通配。
+- RabbitMQ Topic Exchange：真实 RabbitMQ 持久化 Exchange/Queue、手动 ACK、失败重入队和 Publisher Confirm。
 
 ### 原有网盘功能
 - 元数据强一致：通过内置 `raftImpl` 的 Raft KV 保存文件元数据、上传会话、分片状态和目录索引。
@@ -36,16 +36,22 @@
 - 分片下载：客户端获取 manifest 后并行下载 chunk 并在浏览器本地合并；服务端使用流式传输避免大文件 OOM。
 - 块级去重：每个 chunk 计算 SHA256 内容哈希，已存在内容直接复用；引入 Bloom Filter 加速去重预判。
 - 文件删除：支持通过 API 删除文件元数据、秒传索引和存储分片。
+- 用户数据隔离：文件 ID、秒传索引、列表、下载、删除和上传会话均按 JWT 用户隔离；管理员可管理全部文件。
+- 安全删除：通过 chunk hash 分布式锁检查完整文件和进行中上传的引用，仅清理无引用 chunk。
 - 可观测性：结构化 JSON 日志（slog）、统一 INFO 日志宏、requestID 追踪、Prometheus 风格 Metrics 端点、pprof 性能分析。
 - 健康检查：`/healthz` 探活、`/readyz` 就绪检查（含 Raft 连通性验证）。
-- API 鉴权：JWT Bearer Token 认证。
+- API 鉴权：网盘与支付业务接口统一要求 Access Token；Refresh Token 只能用于刷新访问令牌。
 - 优雅关闭：捕获 SIGINT/SIGTERM，超时等待进行中的请求完成后退出。
 
 ## 关键修复
 
+- 修复网盘 API 使用空鉴权中间件的问题，上传、下载、列表和删除接口现统一校验 JWT Access Token。
+- 修复支付路由向 JWT 中间件传入 `nil` 导致请求 panic 的问题，支付业务接口复用主服务的 JWT 实例。
+- JWT Claims 增加 `token_type`，严格区分 Access Token 与 Refresh Token，防止刷新令牌直接访问业务 API。
+- 本次令牌格式升级后，旧版未包含 `token_type` 的 JWT 会被拒绝，客户端需要重新登录获取新令牌。
 - 目录索引从 `catalog:files` 全量读改写改为 `catalog:file:<fileID>` 前缀扫描，避免多实例并发追加时丢更新。
 - 上传分片状态从整份 `UploadSession` 覆盖写改为 `uploadchunk:<uploadID>:<index>` 单独写，降低并发 chunk 上传互相覆盖风险。
-- 秒传索引从单纯 `idx:namehash:<hash>` 改为 `idx:namehash:<hash>:<size>`，避免同名不同大小文件互相覆盖索引。
+- 秒传索引升级为 `idx:ownername:<ownerHash>:<nameHash>:<size>`，避免跨用户秒传泄露及同名不同大小覆盖。
 - Raft GET/PUT/DELETE 只由 leader 承担，客户端遇到 `409 not leader` 使用指数退避 + jitter 重试。
 - Raft `Submit` 等待 Pebble apply 完成后返回，避免 PUT 成功后立刻 GET 读不到。
 - 服务端限制 chunk 请求体大小，并校验每个分片实际大小与上传计划一致。
@@ -56,6 +62,8 @@
 - findChunk：使用内存 Bloom Filter 预判分片是否已存在，减少磁盘 `os.Stat` 扫描。
 - RaftClient：从固定 8 次轮询改为指数退避（50ms→2s）+ 随机抖动，最多 10 次重试。
 - requestID：每个请求注入唯一 ID 并写入响应头，贯穿日志链路。
+- 支付回调校验签名、`app_id`、交易号和实付金额；待支付订单交易号使用 `NULL`。
+- 存储读删严格使用元数据中的 `storage_id`；Raft 客户端按 `leader_id` 映射 HTTP Leader。
 
 ## 启动 Raft 集群
 
@@ -80,6 +88,12 @@ Raft HTTP 接口：
 - `POST /cluster/join`：动态加入节点。
 
 ## 启动网盘服务
+
+服务启动前需准备 MySQL、Redis 与 RabbitMQ。例如：
+
+```bash
+docker run -d --name cloudraft-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
+```
 
 ```bash
 cd /root/projects/webdownld_go.dir
@@ -134,7 +148,7 @@ go run ./cmd/storagenode -grpc=:9003 -data=./data/storage-n3 &
 - `JWT_REFRESH_TTL_DAYS`：刷新令牌有效期（天），默认 `7`
 
 ### 消息队列配置
-- `RABBITMQ_URL`：RabbitMQ 连接地址，当前为内存版 Topic 事件总线
+- `RABBITMQ_URL`：RabbitMQ AMQP 连接地址，默认 `amqp://guest:guest@127.0.0.1:5672/`
 
 ### 支付宝支付配置
 - `ALIPAY_APP_ID`：支付宝应用 ID
@@ -145,6 +159,14 @@ go run ./cmd/storagenode -grpc=:9003 -data=./data/storage-n3 &
 - `ALIPAY_IS_PRODUCTION`：是否生产模式（`false` 为沙箱）
 
 ## API 接口
+
+除注册、登录、刷新令牌、支付宝回调和健康检查外，业务 API 请求必须携带：
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Refresh Token 仅可提交到 `/api/auth/refresh`，不能访问网盘或支付业务接口。
 
 ### 用户认证
 | 方法 | 路径 | 说明 |
@@ -157,22 +179,22 @@ go run ./cmd/storagenode -grpc=:9003 -data=./data/storage-n3 &
 ### 会员充值
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/payment/plans` | 获取会员套餐列表 |
-| POST | `/api/payment/order` | 创建充值订单（返回支付链接） |
+| GET | `/api/payment/plans` | 获取会员套餐列表（需要 Access Token） |
+| POST | `/api/payment/order` | 创建充值订单（需要 Access Token，返回支付链接） |
 | POST | `/api/payment/notify` | 支付宝异步通知回调 |
 | GET | `/api/payment/return` | 支付完成同步跳转 |
 
 ### 网盘操作
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/files` | 列出全部文件 |
-| DELETE | `/api/files/:fileID` | 删除文件及分片 |
-| POST | `/api/uploads/init` | 初始化上传会话 |
-| GET | `/api/uploads/:uploadID/status` | 查询上传进度 |
-| POST | `/api/uploads/:uploadID/chunks/:index` | 上传分片 |
-| POST | `/api/uploads/:uploadID/complete` | 完成上传 |
-| GET | `/api/files/:fileID/manifest` | 获取下载清单 |
-| GET | `/api/files/:fileID/chunks/:index` | 流式下载分片 |
+| GET | `/api/files` | 列出全部文件（需要 Access Token） |
+| DELETE | `/api/files/:fileID` | 删除文件及分片（需要 Access Token） |
+| POST | `/api/uploads/init` | 初始化上传会话（需要 Access Token） |
+| GET | `/api/uploads/:uploadID/status` | 查询上传进度（需要 Access Token） |
+| POST | `/api/uploads/:uploadID/chunks/:index` | 上传分片（需要 Access Token） |
+| POST | `/api/uploads/:uploadID/complete` | 完成上传（需要 Access Token） |
+| GET | `/api/files/:fileID/manifest` | 获取下载清单（需要 Access Token） |
+| GET | `/api/files/:fileID/chunks/:index` | 流式下载分片（需要 Access Token） |
 
 ### 健康检查与观测
 | 方法 | 路径 | 说明 |
@@ -185,10 +207,12 @@ go run ./cmd/storagenode -grpc=:9003 -data=./data/storage-n3 &
 ## 元数据键空间
 - `uploadchunk:<uploadID>:<index>`：单个分片完成状态。
 - `file:<fileID>`：完整文件元数据。
-- `idx:namehash:<nameHash>:<size>`：秒传索引。
+- `idx:ownername:<ownerHash>:<nameHash>:<size>`：按用户隔离的秒传索引。
 - `catalog:file:<fileID>`：目录索引项。
 
 ## 验证
+
+所有主项目测试统一存放在 `test/`；独立 Raft module 的测试存放在 `raftImpl/test/`。生产源码目录不放置 `_test.go` 文件。
 
 ```bash
 cd /root/projects/webdownld_go.dir
@@ -210,7 +234,7 @@ go test ./...
 
 JWT 用户认证与会员系统：自实现 HMAC-SHA256 签名 JWT 双令牌机制（Access Token 2h + Refresh Token 7d），bcrypt 密码哈希存储；MySQL 持久化用户、订单与会员套餐数据，支持注册、登录、令牌刷新、会员状态查询。前端白底轻蓝渐变主题，纯白圆角卡片 UI，登录/注册独立页面。
 
-支付宝支付与 Topic 事件总线：对接支付宝电脑网站支付 API，自实现 RSA-SHA256 请求签名与回调验签（无需第三方 SDK），完整覆盖下单、支付、异步通知、会员开通流程。设计内存版 RabbitMQ Topic Exchange 事件总线，以 `order.created` → `order.paid` → `member.upgraded` routing key 驱动订单状态流转与会员升级，支持 `order.#` / `member.#` 通配符路由匹配。
+支付宝支付与 Topic 事件总线：对接支付宝电脑网站支付 API，自实现 RSA-SHA256 请求签名与回调验签，并校验应用 ID 与实付金额。接入真实 RabbitMQ Topic Exchange，以持久化消息、手动 ACK 和 Publisher Confirm 驱动订单事件流。
 
 内容寻址存储集群：设计 gRPC 流式存储节点服务（SaveChunk / ReadChunk / DeleteChunk），基于 FNV-1a 哈希实现内容寻址路由，将去重与定位收敛为 O(1)；上传时分片流式转发至目标节点，以临时文件 + 原子硬链接安全落盘并实时校验 SHA256；下载时 gRPC 流式回传适配为 io.ReadCloser，实现零拷贝流式响应。
 
@@ -483,7 +507,7 @@ Go 的 `sync.Mutex` 基于 CAS + 信号量实现：
 **答：**
 
 - `FileID` = `SHA256(NameHash(name) + ":" + size)`
-- 秒传索引键：`idx:namehash:<nameHash>:<size>` → value = `fileID`
+- 秒传索引键：`idx:ownername:<ownerHash>:<nameHash>:<size>` → value = `fileID`
 - `initUpload` 查这个索引，命中且文件 `Complete=true` 就跳过上传直接返回
 
 **边界情况修复：** 早期版本秒传索引只用 `nameHash`，同名不同大小的文件会互相覆盖。修复后加入 `size` 维度。即使命中也要检查 `Complete` 标志，防止文件正在上传中但未完成。

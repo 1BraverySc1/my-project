@@ -24,7 +24,7 @@ type DistributedLock struct {
 // LockFactory 分布式锁工厂，管理与 Redis 的连接并创建锁实例。
 // 所有锁实例共享同一个 Redis 连接池（通过互斥锁保护）。
 type LockFactory struct {
-	client *redisClient // client Redis 客户端连接。
+	client *redisClient  // client Redis 客户端连接。
 	ttl    time.Duration // ttl 锁的默认过期时间。
 }
 
@@ -120,14 +120,18 @@ func (l *DistributedLock) startWatchdog() {
 			case <-l.stopCh:
 				return
 			case <-ticker.C:
-				ttlSeconds := int64(l.ttl / time.Second)
-				if ttlSeconds < 1 {
-					ttlSeconds = 1
+				ttlMs := int64(l.ttl / time.Millisecond)
+				if ttlMs < 1 {
+					ttlMs = 1
 				}
-				_, err := l.client.do("EXPIRE", l.key, fmt.Sprintf("%d", ttlSeconds))
+				script := "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end"
+				result, err := l.client.do("EVAL", script, "1", l.key, l.token, fmt.Sprintf("%d", ttlMs))
 				if err != nil {
 					// 续期失败（如 Redis 断连），goroutine 静默退出。
 					// 业务逻辑完成后 Unlock 会尝试主动释放。
+					return
+				}
+				if renewed, _ := result.(int64); renewed == 0 {
 					return
 				}
 			}

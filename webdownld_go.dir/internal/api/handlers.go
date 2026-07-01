@@ -2,12 +2,15 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"webdownld_go/internal/auth"
 	"webdownld_go/internal/config"
 	"webdownld_go/internal/lock"
 	"webdownld_go/internal/meta"
@@ -18,16 +21,17 @@ import (
 )
 
 type Handler struct {
-	meta        *meta.Service       // meta 元数据服务，负责 Raft 一致性读写。
-	storage     *storage.Service    // storage 分片存储服务。
-	chunkSize   int64               // chunkSize 当前服务使用的分片大小（字节）。
-	chunkPool   *ChunkWorkerPool    // chunkPool 固定 worker 分片写入池。
-	lockFactory *lock.LockFactory   // lockFactory 分布式锁工厂，按 uploadID 创建跨实例互斥锁。
+	meta        *meta.Service     // meta 元数据服务，负责 Raft 一致性读写。
+	storage     *storage.Service  // storage 分片存储服务。
+	chunkSize   int64             // chunkSize 当前服务使用的分片大小（字节）。
+	chunkPool   *ChunkWorkerPool  // chunkPool 固定 worker 分片写入池。
+	lockFactory *lock.LockFactory // lockFactory 分布式锁工厂，按 uploadID 创建跨实例互斥锁。
+	jwt         *auth.JWTService  // jwt JWT 服务，用于保护全部网盘业务接口。
 }
 
 // New 创建 API 处理器实例。
-// metaSvc 为元数据服务，storageSvc 为存储服务，maxConcurrentChunkWrites 为并发写入上限，lf 为分布式锁工厂。
-func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkWrites int, lf *lock.LockFactory) *Handler {
+// metaSvc 为元数据服务，storageSvc 为存储服务，maxConcurrentChunkWrites 为并发写入上限，lf 为分布式锁工厂，jwtService 为 JWT 服务。
+func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkWrites int, lf *lock.LockFactory, jwtService *auth.JWTService) *Handler {
 	if maxConcurrentChunkWrites <= 0 {
 		maxConcurrentChunkWrites = 64
 	}
@@ -38,13 +42,14 @@ func New(metaSvc *meta.Service, storageSvc *storage.Service, maxConcurrentChunkW
 	h.chunkSize = config.ChunkSize()
 	h.chunkPool = NewChunkWorkerPool(storageSvc, maxConcurrentChunkWrites, queueSize)
 	h.lockFactory = lf
+	h.jwt = jwtService
 	return h
 }
 
 // Register 注册网盘相关 API 路由。
 func (h *Handler) Register(r *gin.Engine) {
 	api := r.Group("/api")
-	api.Use(AuthMiddleware())
+	api.Use(JWTAuthMiddleware(h.jwt))
 	{
 		api.GET("/files", h.listFiles)
 		api.DELETE("/files/:fileID", h.deleteFile)
@@ -65,7 +70,6 @@ func (h *Handler) initUpload(c *gin.Context) {
 	var req struct {
 		Name       string `json:"name"`       // Name 上传文件名。
 		Size       int64  `json:"size"`       // Size 文件总大小（字节）。
-		Owner      string `json:"owner"`      // Owner 上传者标识。
 		Permission string `json:"permission"` // Permission 文件权限设置。
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Name == "" || req.Size <= 0 {
@@ -73,13 +77,14 @@ func (h *Handler) initUpload(c *gin.Context) {
 		return
 	}
 
+	owner := c.GetString("username")
 	nameHash := meta.NameHash(req.Name)
-	if existing, err := h.meta.GetFileByNameHashAndSize(c.Request.Context(), nameHash, req.Size); err == nil && existing != nil && existing.Complete {
+	if existing, err := h.meta.GetFileByOwnerNameHashAndSize(c.Request.Context(), owner, nameHash, req.Size); err == nil && existing != nil && existing.Complete {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "instant_upload": true, "file": existing})
 		return
 	}
 
-	fileID := meta.FileIDByName(req.Name, req.Size)
+	fileID := meta.FileIDByOwnerAndName(owner, req.Name, req.Size)
 	totalChunks := int((req.Size + h.chunkSize - 1) / h.chunkSize)
 	ss := model.UploadSession{
 		UploadID:    meta.UploadID(fileID),
@@ -87,7 +92,7 @@ func (h *Handler) initUpload(c *gin.Context) {
 		Name:        req.Name,
 		NameHash:    nameHash,
 		Size:        req.Size,
-		Owner:       fallback(req.Owner, "guest"),
+		Owner:       owner,
 		Permission:  fallback(req.Permission, "rw"),
 		ChunkSize:   h.chunkSize,
 		TotalChunks: totalChunks,
@@ -114,7 +119,7 @@ func (h *Handler) initUpload(c *gin.Context) {
 // uploadStatus 返回上传会话的已收分片进度，用于断点续传。
 func (h *Handler) uploadStatus(c *gin.Context) {
 	ss, err := h.meta.GetUploadSession(c.Request.Context(), c.Param("uploadID"))
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, ss.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "upload not found"})
 		return
 	}
@@ -140,7 +145,7 @@ func (h *Handler) uploadChunk(c *gin.Context) {
 	defer dl.Unlock(c.Request.Context())
 
 	ss, err := h.meta.GetUploadSession(c.Request.Context(), uploadID)
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, ss.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "upload not found"})
 		return
 	}
@@ -169,6 +174,14 @@ func (h *Handler) uploadChunk(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "failed to read chunk body"})
 		return
 	}
+	sum := sha256.Sum256(buf)
+	chunkMutationLock := h.lockFactory.NewLock("chunk:mutation:" + hex.EncodeToString(sum[:]))
+	if err := chunkMutationLock.Lock(c.Request.Context()); err != nil {
+		PutChunkBuf(buf)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "服务器繁忙，请重试"})
+		return
+	}
+	defer chunkMutationLock.Unlock(c.Request.Context())
 	result, err := h.chunkPool.Submit(c.Request.Context(), chunkWriteTask{
 		uploadID: ss.UploadID,
 		index:    index,
@@ -223,7 +236,7 @@ func (h *Handler) completeUpload(c *gin.Context) {
 	defer dl.Unlock(c.Request.Context())
 
 	ss, err := h.meta.GetUploadSession(c.Request.Context(), uploadID)
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, ss.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "upload not found"})
 		return
 	}
@@ -272,9 +285,18 @@ func (h *Handler) completeUpload(c *gin.Context) {
 		Chunks:      chunks,
 		Complete:    true,
 	}
+	mutationLock := h.lockFactory.NewLock("files:mutation")
+	if err := mutationLock.Lock(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "服务器繁忙，请重试"})
+		return
+	}
+	defer mutationLock.Unlock(c.Request.Context())
 	if err := h.meta.SaveFile(c.Request.Context(), metaFile); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": err.Error()})
 		return
+	}
+	if err := h.meta.DeleteUploadSession(c.Request.Context(), ss.UploadID); err != nil {
+		INFO("cleanup completed upload session failed", "upload_id", ss.UploadID, "error", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "file": metaFile})
 }
@@ -290,7 +312,13 @@ func (h *Handler) expectedChunkSize(ss *model.UploadSession, index int) int64 {
 
 // listFiles 返回文件目录列表。
 func (h *Handler) listFiles(c *gin.Context) {
-	files, err := h.meta.ListFiles(c.Request.Context())
+	var files []model.FileMeta
+	var err error
+	if c.GetBool("is_admin") {
+		files, err = h.meta.ListFiles(c.Request.Context())
+	} else {
+		files, err = h.meta.ListFilesByOwner(c.Request.Context(), c.GetString("username"))
+	}
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": err.Error()})
 		return
@@ -301,7 +329,7 @@ func (h *Handler) listFiles(c *gin.Context) {
 // fileManifest 返回指定文件的下载清单（分片映射）。
 func (h *Handler) fileManifest(c *gin.Context) {
 	file, err := h.meta.GetFileByID(c.Request.Context(), c.Param("fileID"))
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, file.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "file not found"})
 		return
 	}
@@ -319,7 +347,7 @@ func (h *Handler) fileManifest(c *gin.Context) {
 // downloadChunk 下载指定文件的单个分片内容（流式传输，避免全量读入内存）。
 func (h *Handler) downloadChunk(c *gin.Context) {
 	file, err := h.meta.GetFileByID(c.Request.Context(), c.Param("fileID"))
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, file.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "file not found"})
 		return
 	}
@@ -352,23 +380,41 @@ func (h *Handler) downloadChunk(c *gin.Context) {
 func (h *Handler) deleteFile(c *gin.Context) {
 	fileID := c.Param("fileID")
 	fm, err := h.meta.GetFileByID(c.Request.Context(), fileID)
-	if err != nil {
+	if err != nil || !h.canAccessOwner(c, fm.Owner) {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "file not found"})
 		return
 	}
+	mutationLock := h.lockFactory.NewLock("files:mutation")
+	if err := mutationLock.Lock(c.Request.Context()); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "服务器繁忙，请重试"})
+		return
+	}
+	defer mutationLock.Unlock(c.Request.Context())
 	if err := h.meta.DeleteFile(c.Request.Context(), fm); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": err.Error()})
 		return
 	}
-	// 异步清理存储分片，不阻塞响应。
-	go func() {
-		for _, ch := range fm.Chunks {
-			for _, sid := range ch.StorageIDs {
-				_ = h.storage.DeleteChunk(context.Background(), sid, ch.ChunkHash)
-			}
+	for _, ch := range fm.Chunks {
+		chunkMutationLock := h.lockFactory.NewLock("chunk:mutation:" + ch.ChunkHash)
+		if err := chunkMutationLock.Lock(c.Request.Context()); err != nil {
+			continue
 		}
-	}()
+		referenced, err := h.meta.ChunkReferencedByOtherFile(c.Request.Context(), ch.ChunkHash, fm.FileID)
+		uploadReferenced, uploadErr := h.meta.ChunkReferencedByUpload(c.Request.Context(), ch.ChunkHash)
+		if err != nil || uploadErr != nil || referenced || uploadReferenced {
+			_ = chunkMutationLock.Unlock(c.Request.Context())
+			continue
+		}
+		for _, sid := range ch.StorageIDs {
+			_ = h.storage.DeleteChunk(context.Background(), sid, ch.ChunkHash)
+		}
+		_ = chunkMutationLock.Unlock(c.Request.Context())
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted": fileID})
+}
+
+func (h *Handler) canAccessOwner(c *gin.Context, owner string) bool {
+	return c.GetBool("is_admin") || owner == c.GetString("username")
 }
 
 // fallback 当 v 为空时返回 def，否则返回 v。

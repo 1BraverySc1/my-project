@@ -118,7 +118,12 @@ func JWTAuthMiddleware(jwtService *auth.JWTService) gin.HandlerFunc {
 			return
 		}
 
-		claims, err := jwtService.ValidateToken(token)
+		if jwtService == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"ok": false, "error": "认证服务未配置"})
+			return
+		}
+
+		claims, err := jwtService.ValidateAccessToken(token)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"ok": false, "error": "令牌无效或已过期"})
 			return
@@ -127,15 +132,7 @@ func JWTAuthMiddleware(jwtService *auth.JWTService) gin.HandlerFunc {
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
 		c.Set("is_admin", claims.IsAdmin)
-			c.Set("is_member", claims.IsMember)
-		c.Next()
-	}
-}
-
-// AuthMiddleware 旧版简易鉴权中间件（已废弃，由 JWTAuthMiddleware 替代）。
-// 保留空实现以兼容旧调用，实际鉴权由 JWTAuthMiddleware 完成。
-func AuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
+		c.Set("is_member", claims.IsMember)
 		c.Next()
 	}
 }

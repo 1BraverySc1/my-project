@@ -67,12 +67,19 @@ func main() {
 		}
 	}
 
-	// 初始化 Topic 事件总线（内存版 RabbitMQ）。
-	eventBus := mq.NewTopicExchange()
-	eventBus.InitSubscriptions(func(event []byte) error {
+	// 初始化真实 RabbitMQ Topic Exchange。
+	eventBus, err := mq.NewRabbitMQ(cfg.RabbitMQURL)
+	if err != nil {
+		slog.Error("init RabbitMQ failed", "error", err)
+		os.Exit(1)
+	}
+	if err := eventBus.InitSubscriptions(func(event []byte) error {
 		api.INFO("会员处理回调", "event", string(event))
 		return nil
-	})
+	}); err != nil {
+		slog.Error("init RabbitMQ subscriptions failed", "error", err)
+		os.Exit(1)
+	}
 
 	// 初始化元数据与存储层。
 	metaSvc := meta.NewService(meta.NewRaftClient(cfg.RaftHTTPNodes))
@@ -91,7 +98,7 @@ func main() {
 	}
 	defer lockFactory.Close()
 
-	h := api.New(metaSvc, storageSvc, cfg.MaxConcurrentChunkWrites, lockFactory)
+	h := api.New(metaSvc, storageSvc, cfg.MaxConcurrentChunkWrites, lockFactory, jwtService)
 
 	// 初始化用户认证处理器。
 	// MySQL 可用时：完整注册/登录/令牌刷新（数据库持久化）。
@@ -106,7 +113,7 @@ func main() {
 	// 初始化支付处理器（仅 MySQL 可用时）。
 	var paymentHandler *api.PaymentHandler
 	if mysqlStore != nil && alipaySvc != nil {
-		paymentHandler = api.NewPaymentHandler(mysqlStore.DB, alipaySvc, eventBus, lockFactory)
+		paymentHandler = api.NewPaymentHandler(mysqlStore.DB, alipaySvc, eventBus, lockFactory, jwtService)
 	}
 
 	r := gin.New()

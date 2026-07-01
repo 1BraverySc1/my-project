@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"webdownld_go/internal/auth"
 	"webdownld_go/internal/lock"
 	"webdownld_go/internal/model"
 	"webdownld_go/internal/mq"
@@ -18,24 +19,26 @@ import (
 type PaymentHandler struct {
 	db          *sql.DB                // db MySQL 数据库连接。
 	alipay      *payment.AlipayService // alipay 支付宝支付服务。
-	eventBus    *mq.TopicExchange      // eventBus 订单事件总线。
+	eventBus    *mq.RabbitMQ           // eventBus RabbitMQ 订单事件总线。
 	lockFactory *lock.LockFactory      // lockFactory 分布式锁工厂，防止并发回调重复处理。
+	jwt         *auth.JWTService       // jwt JWT 服务，用于保护支付业务接口。
 }
 
-// NewPaymentHandler 创建支付处理器实例。
-func NewPaymentHandler(database *sql.DB, alipaySvc *payment.AlipayService, bus *mq.TopicExchange, lf *lock.LockFactory) *PaymentHandler {
+// NewPaymentHandler 创建支付处理器实例，并注入保护支付业务接口的 JWT 服务。
+func NewPaymentHandler(database *sql.DB, alipaySvc *payment.AlipayService, bus *mq.RabbitMQ, lf *lock.LockFactory, jwtService *auth.JWTService) *PaymentHandler {
 	h := new(PaymentHandler)
 	h.db = database
 	h.alipay = alipaySvc
 	h.eventBus = bus
 	h.lockFactory = lf
+	h.jwt = jwtService
 	return h
 }
 
 // Register 注册支付相关路由。
 func (h *PaymentHandler) Register(r *gin.Engine) {
 	pay := r.Group("/api/payment")
-	pay.Use(JWTAuthMiddleware(nil)) // 由外部注入，此处占位，实际由 main 统一注册。
+	pay.Use(JWTAuthMiddleware(h.jwt))
 	{
 		pay.GET("/plans", h.listPlans)
 		pay.POST("/order", h.createOrder)
@@ -93,12 +96,14 @@ func (h *PaymentHandler) createOrder(c *gin.Context) {
 	orderID, _ := result.LastInsertId()
 
 	// 发布订单创建事件。
-	h.eventBus.Publish(mq.RoutingKeyOrderCreated, mq.OrderEvent{
+	if err := h.eventBus.Publish(mq.RoutingKeyOrderCreated, mq.OrderEvent{
 		OrderID:    orderID,
 		UserID:     userID,
 		PlanID:     req.PlanID,
 		AmountCent: selectedPlan.PriceCent,
-	})
+	}); err != nil {
+		INFO("发布订单创建事件失败", "order_id", orderID, "error", err)
+	}
 
 	// 生成支付宝支付链接。
 	payURL, err := h.alipay.CreatePaymentOrder(orderID, *selectedPlan)
@@ -109,9 +114,9 @@ func (h *PaymentHandler) createOrder(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"ok":         true,
-		"order_id":   orderID,
-		"pay_url":    payURL,
+		"ok":          true,
+		"order_id":    orderID,
+		"pay_url":     payURL,
 		"amount_cent": selectedPlan.PriceCent,
 	})
 }
@@ -144,17 +149,25 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 
 	outTradeNo := params["out_trade_no"]
 	tradeNo := params["trade_no"]
+	if params["app_id"] != h.alipay.AppID() || tradeNo == "" {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
+	paidAmountCent, err := payment.AmountToCent(params["total_amount"])
+	if err != nil {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
 	orderID, err := strconv.ParseInt(outTradeNo, 10, 64)
 	if err != nil {
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
-
 	// 第一重防护：Redis 分布式锁，按 out_trade_no 串行化处理。
 	dl := h.lockFactory.NewLock("payment:notify:" + outTradeNo)
 	if err := dl.Lock(c.Request.Context()); err != nil {
 		INFO("获取支付回调锁失败，可能并发处理中", "out_trade_no", outTradeNo, "error", err)
-		c.String(http.StatusOK, "success") // 返回 success 让支付宝稍后重试
+		c.String(http.StatusServiceUnavailable, "fail")
 		return
 	}
 	defer dl.Unlock(c.Request.Context())
@@ -184,6 +197,11 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 	if err != nil {
 		INFO("查询订单失败", "error", err)
 		c.String(http.StatusInternalServerError, "fail")
+		return
+	}
+	if paidAmountCent != order.AmountCent {
+		INFO("支付回调金额不匹配", "order_id", orderID, "expected", order.AmountCent, "actual", paidAmountCent)
+		c.String(http.StatusBadRequest, "fail")
 		return
 	}
 
@@ -234,18 +252,22 @@ func (h *PaymentHandler) paymentNotify(c *gin.Context) {
 	}
 
 	// 发布支付成功和会员升级事件（事务提交后，避免未提交就读到）。
-	h.eventBus.Publish(mq.RoutingKeyOrderPaid, mq.OrderEvent{
+	if err := h.eventBus.Publish(mq.RoutingKeyOrderPaid, mq.OrderEvent{
 		OrderID:    orderID,
 		UserID:     order.UserID,
 		PlanID:     order.PlanID,
 		AmountCent: order.AmountCent,
 		TradeNo:    tradeNo,
-	})
-	h.eventBus.Publish(mq.RoutingKeyMemberUpgrade, mq.OrderEvent{
+	}); err != nil {
+		INFO("发布支付成功事件失败", "order_id", orderID, "error", err)
+	}
+	if err := h.eventBus.Publish(mq.RoutingKeyMemberUpgrade, mq.OrderEvent{
 		OrderID: orderID,
 		UserID:  order.UserID,
 		PlanID:  order.PlanID,
-	})
+	}); err != nil {
+		INFO("发布会员升级事件失败", "order_id", orderID, "error", err)
+	}
 
 	c.String(http.StatusOK, "success")
 }

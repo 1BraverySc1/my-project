@@ -1,124 +1,172 @@
 package mq
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// OrderEvent 描述一次订单状态变更的消息体。
+const exchangeName = "cloudraft.events"
+
 type OrderEvent struct {
-	OrderID    int64  `json:"order_id"`       // OrderID 订单唯一标识。
-	UserID     int64  `json:"user_id"`        // UserID 下单用户 ID。
-	PlanID     int64  `json:"plan_id"`        // PlanID 购买的套餐 ID。
-	AmountCent int64  `json:"amount_cent"`    // AmountCent 订单金额（分）。
-	TradeNo    string `json:"alipay_trade_no"` // TradeNo 支付宝流水号。
+	OrderID    int64  `json:"order_id"`
+	UserID     int64  `json:"user_id"`
+	PlanID     int64  `json:"plan_id"`
+	AmountCent int64  `json:"amount_cent"`
+	TradeNo    string `json:"alipay_trade_no"`
 }
 
-// 路由键常量，定义 Topic Exchange 中的消息路由规则。
 const (
-	RoutingKeyOrderCreated  = "order.created"   // RoutingKeyOrderCreated 订单新建事件。
-	RoutingKeyOrderPaid     = "order.paid"      // RoutingKeyOrderPaid 支付成功事件。
-	RoutingKeyOrderExpired  = "order.expired"   // RoutingKeyOrderExpired 订单超时事件。
-	RoutingKeyMemberUpgrade = "member.upgraded" // RoutingKeyMemberUpgrade 会员开通成功事件。
+	RoutingKeyOrderCreated  = "order.created"
+	RoutingKeyOrderPaid     = "order.paid"
+	RoutingKeyOrderExpired  = "order.expired"
+	RoutingKeyMemberUpgrade = "member.upgraded"
 )
 
-// Subscriber 消息处理函数签名，接收事件字节并返回可能的错误。
 type Subscriber func(event []byte) error
 
-// TopicExchange 基于 Topic 模式的内存事件总线，模拟 RabbitMQ Topic Exchange。
-// 使用 goroutine + channel 实现异步消息分发，支持通配符路由键匹配。
-type TopicExchange struct {
-	mu      sync.RWMutex
-	subs    map[string][]Subscriber // subs routingKey → 订阅者列表。
-	closeCh chan struct{}           // closeCh 通知所有消费者停止。
+// RabbitMQ 封装真实 RabbitMQ Topic Exchange、发布通道和消费者生命周期。
+type RabbitMQ struct {
+	conn      *amqp.Connection
+	publishCh *amqp.Channel
+	confirms  <-chan amqp.Confirmation
+	mu        sync.Mutex
+	wg        sync.WaitGroup
 }
 
-// NewTopicExchange 创建 Topic 事件总线实例。
-func NewTopicExchange() *TopicExchange {
-	e := new(TopicExchange)
-	e.subs = make(map[string][]Subscriber)
-	e.closeCh = make(chan struct{})
-	return e
+func NewRabbitMQ(rawURL string) (*RabbitMQ, error) {
+	conn, err := amqp.Dial(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect rabbitmq: %w", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("open rabbitmq publish channel: %w", err)
+	}
+	if err := ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("declare rabbitmq exchange: %w", err)
+	}
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("enable rabbitmq publisher confirms: %w", err)
+	}
+	return &RabbitMQ{conn: conn, publishCh: ch, confirms: ch.NotifyPublish(make(chan amqp.Confirmation, 1))}, nil
 }
 
-// Publish 向指定路由键发布事件消息，异步分发给所有匹配的订阅者。
-func (e *TopicExchange) Publish(routingKey string, event OrderEvent) {
+func (r *RabbitMQ) Publish(routingKey string, event OrderEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil {
-		slog.Error("序列化事件失败", "routingKey", routingKey, "error", err)
+		return fmt.Errorf("marshal event: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	err = r.publishCh.PublishWithContext(ctx, exchangeName, routingKey, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		Timestamp:    time.Now(),
+		Body:         data,
+	})
+	if err != nil {
+		return fmt.Errorf("publish %s: %w", routingKey, err)
+	}
+	select {
+	case confirmation := <-r.confirms:
+		if !confirmation.Ack {
+			return fmt.Errorf("rabbitmq rejected %s", routingKey)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait rabbitmq confirm for %s: %w", routingKey, ctx.Err())
+	}
+}
+
+func (r *RabbitMQ) Subscribe(queueName, bindingKey string, sub Subscriber) error {
+	ch, err := r.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("open consumer channel: %w", err)
+	}
+	if err := ch.Qos(16, 0, false); err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("set consumer qos: %w", err)
+	}
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("declare queue %s: %w", queueName, err)
+	}
+	if err := ch.QueueBind(q.Name, bindingKey, exchangeName, false, nil); err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("bind queue %s: %w", queueName, err)
+	}
+	deliveries, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("consume queue %s: %w", queueName, err)
+	}
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer ch.Close()
+		for delivery := range deliveries {
+			if err := sub(delivery.Body); err != nil {
+				slog.Error("RabbitMQ event handler failed", "queue", queueName, "routing_key", delivery.RoutingKey, "error", err)
+				_ = delivery.Nack(false, true)
+				continue
+			}
+			_ = delivery.Ack(false)
+		}
+	}()
+	return nil
+}
+
+func (r *RabbitMQ) InitSubscriptions(membershipCallback Subscriber) error {
+	if err := r.Subscribe("cloudraft.order.audit", "order.#", func(event []byte) error {
+		var evt OrderEvent
+		if err := json.Unmarshal(event, &evt); err != nil {
+			return err
+		}
+		slog.Info("order event", "order_id", evt.OrderID, "user_id", evt.UserID, "amount_cent", evt.AmountCent)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := r.Subscribe("cloudraft.order.paid", RoutingKeyOrderPaid, membershipCallback); err != nil {
+		return err
+	}
+	return r.Subscribe("cloudraft.member.audit", "member.#", func(event []byte) error {
+		var evt OrderEvent
+		if err := json.Unmarshal(event, &evt); err != nil {
+			return err
+		}
+		slog.Info("member event", "user_id", evt.UserID, "plan_id", evt.PlanID)
+		return nil
+	})
+}
+
+func (r *RabbitMQ) Shutdown() {
+	if r == nil {
 		return
 	}
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	for key, subs := range e.subs {
-		if e.matchRoute(key, routingKey) {
-			for _, sub := range subs {
-				go func(s Subscriber, d []byte) {
-					if err := s(d); err != nil {
-						slog.Error("事件处理失败", "routingKey", routingKey, "error", err)
-					}
-				}(sub, data)
-			}
-		}
+	r.mu.Lock()
+	if r.publishCh != nil {
+		_ = r.publishCh.Close()
 	}
-	slog.Info("事件已发布", "routingKey", routingKey)
-}
-
-// Subscribe 向指定路由键注册订阅者。
-// bindingKey 支持通配符 *（匹配单段）和 #（匹配多段）。
-func (e *TopicExchange) Subscribe(bindingKey string, sub Subscriber) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.subs[bindingKey] = append(e.subs[bindingKey], sub)
-}
-
-// matchRoute 判断路由键是否匹配绑定键（支持 * 和 # 通配符）。
-func (e *TopicExchange) matchRoute(bindingKey, routingKey string) bool {
-	if bindingKey == "#" {
-		return true
+	if r.conn != nil {
+		_ = r.conn.Close()
 	}
-	if bindingKey == routingKey {
-		return true
-	}
-	if bindingKey == "order.#" {
-		return len(routingKey) >= 6 && routingKey[:6] == "order."
-	}
-	if bindingKey == "member.#" {
-		return len(routingKey) >= 7 && routingKey[:7] == "member."
-	}
-	return false
-}
-
-// Shutdown 停止事件总线，通知所有消费者退出。
-func (e *TopicExchange) Shutdown() {
-	close(e.closeCh)
-}
-
-// InitSubscriptions 注册默认的事件订阅者（日志记录、会员处理）。
-func (e *TopicExchange) InitSubscriptions(membershipCallback Subscriber) {
-	// 订单日志订阅：监听所有 order.* 事件。
-	e.Subscribe("order.#", func(event []byte) error {
-		var evt OrderEvent
-		if err := json.Unmarshal(event, &evt); err != nil {
-			return err
-		}
-		slog.Info("订单日志", "order_id", evt.OrderID, "user_id", evt.UserID, "amount_cent", evt.AmountCent)
-		return nil
-	})
-
-	// 支付成功 → 开通会员。
-	e.Subscribe("order.paid", membershipCallback)
-
-	// 会员升级日志。
-	e.Subscribe("member.upgraded", func(event []byte) error {
-		var evt OrderEvent
-		if err := json.Unmarshal(event, &evt); err != nil {
-			return err
-		}
-		slog.Info("会员升级", "user_id", evt.UserID, "plan_id", evt.PlanID)
-		return nil
-	})
+	r.mu.Unlock()
+	r.wg.Wait()
 }

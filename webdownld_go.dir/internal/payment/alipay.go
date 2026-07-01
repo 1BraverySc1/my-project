@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,13 +23,41 @@ import (
 // AlipayService 支付宝支付服务，封装下单、签名、验签等核心逻辑。
 // 对接支付宝开放平台电脑/手机网站支付接口。
 type AlipayService struct {
-	appID          string          // appID 支付宝开放平台应用 ID。
-	appPrivateKey  *rsa.PrivateKey // appPrivateKey 用于请求签名。
-	alipayPublicKey *rsa.PublicKey // alipayPublicKey 用于回调验签。
-	notifyURL      string          // notifyURL 支付宝异步通知回调 URL。
-	returnURL      string          // returnURL 支付完成同步跳转 URL。
-	isProduction   bool            // isProduction 沙箱模式/生产模式。
-	httpClient     *http.Client    // httpClient 复用的 HTTP 客户端。
+	appID           string          // appID 支付宝开放平台应用 ID。
+	appPrivateKey   *rsa.PrivateKey // appPrivateKey 用于请求签名。
+	alipayPublicKey *rsa.PublicKey  // alipayPublicKey 用于回调验签。
+	notifyURL       string          // notifyURL 支付宝异步通知回调 URL。
+	returnURL       string          // returnURL 支付完成同步跳转 URL。
+	isProduction    bool            // isProduction 沙箱模式/生产模式。
+	httpClient      *http.Client    // httpClient 复用的 HTTP 客户端。
+}
+
+// AppID 返回当前支付宝应用 ID，用于回调身份校验。
+func (s *AlipayService) AppID() string { return s.appID }
+
+// AmountToCent 将支付宝两位小数金额转换为分，拒绝负数和超过两位小数的值。
+func AmountToCent(amount string) (int64, error) {
+	parts := strings.Split(strings.TrimSpace(amount), ".")
+	if len(parts) > 2 || len(parts) == 0 || parts[0] == "" || strings.HasPrefix(parts[0], "-") {
+		return 0, fmt.Errorf("invalid amount")
+	}
+	whole, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid amount: %w", err)
+	}
+	fraction := ""
+	if len(parts) == 2 {
+		fraction = parts[1]
+	}
+	if len(fraction) > 2 {
+		return 0, fmt.Errorf("invalid amount precision")
+	}
+	fraction += strings.Repeat("0", 2-len(fraction))
+	cents, err := strconv.ParseInt(fraction, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid amount: %w", err)
+	}
+	return whole*100 + cents, nil
 }
 
 // NewAlipayService 创建支付宝服务实例。

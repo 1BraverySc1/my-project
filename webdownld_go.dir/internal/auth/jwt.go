@@ -13,17 +13,24 @@ import (
 
 // JWTClaims 自定义 JWT 载荷，包含用户身份与会员状态。
 type JWTClaims struct {
-	UserID   int64  `json:"user_id"`   // UserID 登录用户的唯一标识。
-	Username string `json:"username"`  // Username 登录账号名。
-	IsAdmin  bool   `json:"is_admin"`  // IsAdmin 是否为系统管理员。
-	IsMember bool   `json:"is_member"` // IsMember 当前是否为有效会员。
+	UserID    int64  `json:"user_id"`    // UserID 登录用户的唯一标识。
+	Username  string `json:"username"`   // Username 登录账号名。
+	IsAdmin   bool   `json:"is_admin"`   // IsAdmin 是否为系统管理员。
+	IsMember  bool   `json:"is_member"`  // IsMember 当前是否为有效会员。
+	TokenType string `json:"token_type"` // TokenType 令牌类型，取值为 access 或 refresh。
 }
+
+// JWT 令牌类型常量，用于阻止刷新令牌访问业务 API。
+const (
+	TokenTypeAccess  = "access"
+	TokenTypeRefresh = "refresh"
+)
 
 // JWTService JWT 令牌服务，负责生成和校验访问令牌与刷新令牌。
 type JWTService struct {
-	secret      []byte        // secret 用于签名 JWT 的对称密钥。
-	accessTTL   time.Duration // accessTTL Access Token 的生存时间。
-	refreshTTL  time.Duration // refreshTTL Refresh Token 的生存时间。
+	secret     []byte        // secret 用于签名 JWT 的对称密钥。
+	accessTTL  time.Duration // accessTTL Access Token 的生存时间。
+	refreshTTL time.Duration // refreshTTL Refresh Token 的生存时间。
 }
 
 // NewJWTService 创建 JWT 服务实例。
@@ -38,27 +45,28 @@ func NewJWTService(secret string, accessTTL, refreshTTL time.Duration) *JWTServi
 
 // GenerateAccessToken 为用户生成短期访问令牌。
 func (s *JWTService) GenerateAccessToken(userID int64, username string, isAdmin, isMember bool) (string, error) {
-	return s.signToken(userID, username, isAdmin, isMember, s.accessTTL)
+	return s.signToken(userID, username, isAdmin, isMember, TokenTypeAccess, s.accessTTL)
 }
 
 // GenerateRefreshToken 为用户生成长期刷新令牌，用于续期访问令牌。
-func (s *JWTService) GenerateRefreshToken(userID int64, username string) (string, error) {
-	return s.signToken(userID, username, false, false, s.refreshTTL)
+func (s *JWTService) GenerateRefreshToken(userID int64, username string, isAdmin bool) (string, error) {
+	return s.signToken(userID, username, isAdmin, false, TokenTypeRefresh, s.refreshTTL)
 }
 
 // signToken 构造 JWT 三段式令牌并返回。
-func (s *JWTService) signToken(userID int64, username string, isAdmin, isMember bool, ttl time.Duration) (string, error) {
+func (s *JWTService) signToken(userID int64, username string, isAdmin, isMember bool, tokenType string, ttl time.Duration) (string, error) {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 
 	now := time.Now()
 	claims := map[string]any{
-		"user_id":   userID,
-		"username":  username,
-		"is_admin":  isAdmin,
-		"is_member": isMember,
-		"iat":       now.Unix(),
-		"exp":       now.Add(ttl).Unix(),
-		"iss":       "cloudraft-drive",
+		"user_id":    userID,
+		"username":   username,
+		"is_admin":   isAdmin,
+		"is_member":  isMember,
+		"token_type": tokenType,
+		"iat":        now.Unix(),
+		"exp":        now.Add(ttl).Unix(),
+		"iss":        "cloudraft-drive",
 	}
 	payloadBytes, err := json.Marshal(claims)
 	if err != nil {
@@ -119,6 +127,36 @@ func (s *JWTService) ValidateToken(tokenString string) (*JWTClaims, error) {
 	}
 	if v, ok := raw["is_member"].(bool); ok {
 		claims.IsMember = v
+	}
+	if v, ok := raw["token_type"].(string); ok {
+		claims.TokenType = v
+	}
+	if claims.UserID <= 0 || claims.Username == "" || claims.TokenType == "" {
+		return nil, errors.New("令牌载荷无效")
+	}
+	return claims, nil
+}
+
+// ValidateAccessToken 验证令牌有效且类型为访问令牌。
+func (s *JWTService) ValidateAccessToken(tokenString string) (*JWTClaims, error) {
+	claims, err := s.ValidateToken(tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != TokenTypeAccess {
+		return nil, errors.New("令牌不是访问令牌")
+	}
+	return claims, nil
+}
+
+// ValidateRefreshToken 验证令牌有效且类型为刷新令牌。
+func (s *JWTService) ValidateRefreshToken(tokenString string) (*JWTClaims, error) {
+	claims, err := s.ValidateToken(tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != TokenTypeRefresh {
+		return nil, errors.New("令牌不是刷新令牌")
 	}
 	return claims, nil
 }

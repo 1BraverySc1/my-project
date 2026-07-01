@@ -37,9 +37,9 @@ func NameHash(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// FileIDByName 基于文件名哈希与大小生成稳定文件 ID。
-func FileIDByName(name string, size int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", NameHash(name), size)))
+// FileIDByOwnerAndName 基于所有者、文件名哈希与大小生成稳定文件 ID。
+func FileIDByOwnerAndName(owner, name string, size int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", strings.TrimSpace(owner), NameHash(name), size)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -100,6 +100,24 @@ func (s *Service) SaveUploadChunk(ctx context.Context, uploadID string, ch model
 	return s.raft.Put(ctx, uploadChunkKey(uploadID, ch.Index), buf.String())
 }
 
+// DeleteUploadSession 删除已完成上传的会话与分片状态。
+func (s *Service) DeleteUploadSession(ctx context.Context, uploadID string) error {
+	items, err := s.raft.ListPrefix(ctx, uploadChunkPrefix(uploadID))
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for _, item := range items {
+		if err := s.raft.Delete(ctx, item.Key); err != nil {
+			lastErr = err
+		}
+	}
+	if err := s.raft.Delete(ctx, "upload:"+uploadID); err != nil {
+		lastErr = err
+	}
+	return lastErr
+}
+
 // SaveFile 保存文件元数据并更新名称索引与文件目录。
 // fm 为完整文件元数据对象。
 func (s *Service) SaveFile(ctx context.Context, fm model.FileMeta) error {
@@ -111,7 +129,7 @@ func (s *Service) SaveFile(ctx context.Context, fm model.FileMeta) error {
 	if err := s.raft.Put(ctx, "file:"+fm.FileID, data); err != nil {
 		return err
 	}
-	if err := s.raft.Put(ctx, nameSizeIndexKey(fm.NameHash, fm.Size), fm.FileID); err != nil {
+	if err := s.raft.Put(ctx, ownerNameSizeIndexKey(fm.Owner, fm.NameHash, fm.Size), fm.FileID); err != nil {
 		return err
 	}
 	return s.raft.Put(ctx, "catalog:file:"+fm.FileID, fm.FileID)
@@ -131,8 +149,8 @@ func (s *Service) GetFileByID(ctx context.Context, fileID string) (*model.FileMe
 }
 
 // GetFileByNameHash 按名称哈希查询文件元数据。
-func (s *Service) GetFileByNameHashAndSize(ctx context.Context, nameHash string, size int64) (*model.FileMeta, error) {
-	fileID, err := s.raft.Get(ctx, nameSizeIndexKey(nameHash, size))
+func (s *Service) GetFileByOwnerNameHashAndSize(ctx context.Context, owner, nameHash string, size int64) (*model.FileMeta, error) {
+	fileID, err := s.raft.Get(ctx, ownerNameSizeIndexKey(owner, nameHash, size))
 	if err != nil {
 		return nil, err
 	}
@@ -159,14 +177,63 @@ func (s *Service) ListFiles(ctx context.Context) ([]model.FileMeta, error) {
 	return out, nil
 }
 
-// DeleteFile 删除文件元数据、秒传索引和目录项（存储分片由调用方异步清理）。
+// ListFilesByOwner 列出指定用户拥有的全部文件。
+func (s *Service) ListFilesByOwner(ctx context.Context, owner string) ([]model.FileMeta, error) {
+	files, err := s.ListFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.FileMeta, 0, len(files))
+	for _, fm := range files {
+		if fm.Owner == owner {
+			out = append(out, fm)
+		}
+	}
+	return out, nil
+}
+
+// ChunkReferencedByOtherFile 判断分片是否仍被目标文件之外的文件引用。
+func (s *Service) ChunkReferencedByOtherFile(ctx context.Context, chunkHash, excludedFileID string) (bool, error) {
+	files, err := s.ListFiles(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, fm := range files {
+		if fm.FileID == excludedFileID {
+			continue
+		}
+		for _, ch := range fm.Chunks {
+			if ch.ChunkHash == chunkHash {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// ChunkReferencedByUpload 判断分片是否仍被任意进行中的上传会话引用。
+func (s *Service) ChunkReferencedByUpload(ctx context.Context, chunkHash string) (bool, error) {
+	items, err := s.raft.ListPrefix(ctx, "uploadchunk:")
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		var ch model.UploadChunkState
+		if json.Unmarshal([]byte(item.Value), &ch) == nil && ch.ChunkHash == chunkHash {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// DeleteFile 删除文件元数据、秒传索引和目录项（存储分片由调用方按引用情况清理）。
 func (s *Service) DeleteFile(ctx context.Context, fm *model.FileMeta) error {
 	// 顺序不重要，尽力删除。
 	var lastErr error
 	if err := s.raft.Delete(ctx, "file:"+fm.FileID); err != nil {
 		lastErr = err
 	}
-	if err := s.raft.Delete(ctx, nameSizeIndexKey(fm.NameHash, fm.Size)); err != nil {
+	if err := s.raft.Delete(ctx, ownerNameSizeIndexKey(fm.Owner, fm.NameHash, fm.Size)); err != nil {
 		lastErr = err
 	}
 	if err := s.raft.Delete(ctx, "catalog:file:"+fm.FileID); err != nil {
@@ -176,8 +243,9 @@ func (s *Service) DeleteFile(ctx context.Context, fm *model.FileMeta) error {
 }
 
 // nameSizeIndexKey 构造名称+大小全局索引键，用于秒传判定。
-func nameSizeIndexKey(nameHash string, size int64) string {
-	return fmt.Sprintf("idx:namehash:%s:%d", nameHash, size)
+func ownerNameSizeIndexKey(owner, nameHash string, size int64) string {
+	ownerHash := sha256.Sum256([]byte(strings.TrimSpace(owner)))
+	return fmt.Sprintf("idx:ownername:%s:%s:%d", hex.EncodeToString(ownerHash[:]), nameHash, size)
 }
 
 // uploadChunkPrefix 构造上传分片键前缀，用于前缀扫描。

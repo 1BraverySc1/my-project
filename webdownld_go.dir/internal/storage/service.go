@@ -18,16 +18,17 @@ import (
 
 // conn 包装一个 gRPC 连接及其存储节点客户端。
 type conn struct {
-	cc     *grpc.ClientConn       // cc gRPC 底层连接。
-	client pb.StorageNodeClient   // client 存储节点 gRPC 客户端。
+	cc     *grpc.ClientConn     // cc gRPC 底层连接。
+	client pb.StorageNodeClient // client 存储节点 gRPC 客户端。
 }
 
 // Service 是分片存储服务，负责将分片路由到对应的存储节点。
 type Service struct {
-	nodes   []string          // nodes 存储节点 gRPC 地址列表。
-	clients map[string]conn   // clients 按地址缓存的 gRPC 连接。
-	mu      sync.RWMutex      // mu 保护 clients 并发访问。
-	bf      *bloom.Filter     // bf 内存 Bloom Filter，加速去重预判。
+	nodes     []string          // nodes 存储节点 gRPC 地址列表。
+	clients   map[string]conn   // clients 按地址缓存的 gRPC 连接。
+	nodeAddrs map[string]string // nodeAddrs 存储节点 ID 到 gRPC 地址的映射。
+	mu        sync.RWMutex      // mu 保护 clients 并发访问。
+	bf        *bloom.Filter     // bf 内存 Bloom Filter，加速去重预判。
 }
 
 // NewService 创建存储服务并预拨所有节点。
@@ -36,8 +37,11 @@ func NewService(nodes []string) (*Service, error) {
 	s := new(Service)
 	s.nodes = nodes
 	s.clients = make(map[string]conn)
+	s.nodeAddrs = make(map[string]string)
 	s.bf = bloom.New()
-	for _, addr := range nodes {
+	for i, addr := range nodes {
+		s.nodeAddrs[fmt.Sprintf("node-%d", i+1)] = addr
+		s.nodeAddrs[addr] = addr
 		if _, err := s.getOrDial(addr); err != nil {
 			return nil, fmt.Errorf("dial %s: %w", addr, err)
 		}
@@ -84,6 +88,27 @@ func (s *Service) getClient(chunkHash string) (pb.StorageNodeClient, string, err
 	return c.client, addr, nil
 }
 
+func (s *Service) getClientByStorageID(storageID string) (pb.StorageNodeClient, string, error) {
+	addr := s.nodeAddrs[storageID]
+	if addr == "" {
+		return nil, "", fmt.Errorf("unknown storage node %q", storageID)
+	}
+	c, err := s.getOrDial(addr)
+	if err != nil {
+		return nil, "", err
+	}
+	return c.client, addr, nil
+}
+
+func (s *Service) storageIDForAddr(addr string) string {
+	for id, candidate := range s.nodeAddrs {
+		if candidate == addr && id != addr {
+			return id
+		}
+	}
+	return addr
+}
+
 // pickNode 根据 chunkHash 选择目标存储节点。
 func (s *Service) pickNode(chunkHash string) string { return hashRoute(chunkHash, s.nodes) }
 
@@ -121,7 +146,7 @@ func (s *Service) SaveChunk(ctx context.Context, uploadID string, index int, dat
 			defer cancel()
 			resp, rerr := client.ChunkExists(ctx2, &pb.ChunkRequest{ChunkHash: chunkHash})
 			if rerr == nil && resp.Exists {
-				return chunkHash, size, addr, true, nil
+				return chunkHash, size, s.storageIDForAddr(addr), true, nil
 			}
 		}
 	}
@@ -159,7 +184,7 @@ func (s *Service) SaveChunk(ctx context.Context, uploadID string, index int, dat
 // ReadChunk 从指定存储节点流式读取分片内容。
 // ctx 为请求上下文，storageID 为目标节点标识，chunkHash 为分片内容哈希，chunkSize 为分片预期大小（用于 Content-Length）。
 func (s *Service) ReadChunk(ctx context.Context, storageID, chunkHash string, chunkSize int64) (io.ReadCloser, int64, error) {
-	client, _, err := s.getClient(chunkHash)
+	client, _, err := s.getClientByStorageID(storageID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -225,7 +250,7 @@ func (s *Service) OpenChunk(ctx context.Context, storageID, chunkHash string, ch
 // DeleteChunk 从指定存储节点删除分片。
 // ctx 为请求上下文，storageID 为目标节点，chunkHash 为待删除分片哈希。
 func (s *Service) DeleteChunk(ctx context.Context, storageID, chunkHash string) error {
-	client, _, err := s.getClient(chunkHash)
+	client, _, err := s.getClientByStorageID(storageID)
 	if err != nil {
 		return err
 	}
@@ -244,4 +269,3 @@ func (s *Service) Close() {
 	}
 	s.clients = make(map[string]conn)
 }
-

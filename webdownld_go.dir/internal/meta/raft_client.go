@@ -16,9 +16,10 @@ import (
 )
 
 type RaftClient struct {
-	mu    sync.Mutex
-	nodes []string     // nodes Raft HTTP 节点地址列表。
-	http  *http.Client // http 复用的 HTTP 客户端。
+	mu         sync.Mutex
+	nodes      []string     // nodes 按访问优先级排列的 Raft HTTP 节点地址。
+	configured []string     // configured 按节点 ID 固定排列的原始配置。
+	http       *http.Client // http 复用的 HTTP 客户端。
 }
 
 type KVItem struct {
@@ -27,9 +28,9 @@ type KVItem struct {
 }
 
 const (
-	maxRetries       = 10
-	baseBackoff      = 50 * time.Millisecond
-	maxBackoff       = 2 * time.Second
+	maxRetries  = 10
+	baseBackoff = 50 * time.Millisecond
+	maxBackoff  = 2 * time.Second
 )
 
 // backoff 计算指数退避时间，带 ±25% 随机抖动。
@@ -55,7 +56,8 @@ func isTemporary(err error, statusCode int) bool {
 // nodes 为可访问的 Raft HTTP 节点列表。
 func NewRaftClient(nodes []string) *RaftClient {
 	rc := new(RaftClient)
-	rc.nodes = nodes
+	rc.nodes = append([]string(nil), nodes...)
+	rc.configured = append([]string(nil), nodes...)
 	rc.http = new(http.Client)
 	rc.http.Timeout = 4 * time.Second
 	return rc
@@ -96,7 +98,7 @@ func (r *RaftClient) getWithBackoff(ctx context.Context, key string) (string, er
 				break
 			}
 		} else {
-			if leader := leaderAddr(resp); resp.StatusCode == http.StatusConflict && leader != "" {
+			if leader := leaderAddr(resp, r.configuredNodes()); resp.StatusCode == http.StatusConflict && leader != "" {
 				_ = resp.Body.Close()
 				r.promote(leader)
 				nodes = r.snapshotNodes()
@@ -157,7 +159,7 @@ func (r *RaftClient) ListPrefix(ctx context.Context, prefix string) ([]KVItem, e
 				break
 			}
 		} else {
-			if leader := leaderAddr(resp); resp.StatusCode == http.StatusConflict && leader != "" {
+			if leader := leaderAddr(resp, r.configuredNodes()); resp.StatusCode == http.StatusConflict && leader != "" {
 				_ = resp.Body.Close()
 				r.promote(leader)
 				nodes = r.snapshotNodes()
@@ -203,7 +205,7 @@ func (r *RaftClient) doWithRetry(ctx context.Context, doReq func(node string) (*
 				_ = resp.Body.Close()
 				return nil
 			}
-			if leader := leaderAddr(resp); resp.StatusCode == http.StatusConflict && leader != "" {
+			if leader := leaderAddr(resp, r.configuredNodes()); resp.StatusCode == http.StatusConflict && leader != "" {
 				_ = resp.Body.Close()
 				r.promote(leader)
 				nodes = r.snapshotNodes()
@@ -244,6 +246,12 @@ func (r *RaftClient) snapshotNodes() []string {
 	return nodes
 }
 
+func (r *RaftClient) configuredNodes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.configured...)
+}
+
 // promote 将指定 node 提升到客户端节点列表首位，加速后续 Leader 路由。
 func (r *RaftClient) promote(node string) {
 	node = strings.TrimSpace(node)
@@ -263,11 +271,12 @@ func (r *RaftClient) promote(node string) {
 }
 
 // leaderAddr 从 HTTP 409 响应体中解析 Raft Leader 地址。
-func leaderAddr(resp *http.Response) string {
+func leaderAddr(resp *http.Response, nodes []string) string {
 	if resp == nil || resp.StatusCode != http.StatusConflict {
 		return ""
 	}
 	var body struct {
+		LeaderID   int    `json:"leader_id"`
 		LeaderAddr string `json:"leader_addr"`
 		LeaderHint struct {
 			Addr string `json:"addr"`
@@ -277,6 +286,9 @@ func leaderAddr(resp *http.Response) string {
 	_ = json.Unmarshal(b, &body)
 	if body.LeaderAddr != "" {
 		return body.LeaderAddr
+	}
+	if body.LeaderID > 0 && body.LeaderID <= len(nodes) {
+		return strings.TrimSpace(nodes[body.LeaderID-1])
 	}
 	return body.LeaderHint.Addr
 }
