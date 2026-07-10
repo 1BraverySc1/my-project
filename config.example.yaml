@@ -1,0 +1,26 @@
+server:
+  addr: ":8188"
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  dsn: "root:password@tcp(127.0.0.1:3306)/creator_platform?charset=utf8mb4&parseTime=True&loc=Local"
+  max_open_conns: 25
+  max_idle_conns: 10
+  conn_max_lifetime: 5m
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  lock_ttl: 30s
+
+jwt:
+  secret: "change-me-in-production"
+  access_ttl: 2h
+  refresh_ttl: 168h
+
+upload:
+  chunk_size: 4194304
+  max_concurrent_writes: 64
+  data_dir: "./data"
